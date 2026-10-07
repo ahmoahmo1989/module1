@@ -7,6 +7,10 @@ const nl = s => esc(s).replace(/\n/g, '<br>');
 const words = t => (String(t || '').trim().match(/\S+/g) || []).length;
 const fmtD = t => t ? new Date(t).toLocaleString('ar-EG', { dateStyle: 'medium', timeStyle: 'short' }) : '—';
 const today = () => new Date().toISOString().slice(0, 10);
+/* وضع السحابة: يُفعَّل بوضع رابط Google Apps Script في config.js */
+const API = String(window.MODULE1_API || '').trim(), CLOUD = !!API;
+let CRED = null, TPIN = null, DB_TEACHER = false;
+try { CRED = sessionStorage.getItem('module1_cred'); } catch (e) {}
 
 /* ---------- التخزين ---------- */
 const KEY = 'module1_db_v1';
@@ -17,16 +21,62 @@ function loadDB() {
   Object.keys(DB.students).forEach(k => { const s = DB.students[k]; if (!s.user) s.user = k; });
   DB.settings = Object.assign({ teacherPin: '1234', podcast: '', mastery: 80 }, DB.settings || {});
 }
-function save() { try { localStorage.setItem(KEY, JSON.stringify(DB)); } catch (e) { toast('تعذر الحفظ: مساحة التخزين ممتلئة أو معطلة'); } }
+function saveLocal() { if (DB_TEACHER) return; try { localStorage.setItem(KEY, JSON.stringify(DB)); } catch (e) { toast('تعذر الحفظ: مساحة التخزين ممتلئة أو معطلة'); } }
+function save() { saveLocal(); schedulePush(); }
 loadDB();
 let CUR = null;
 try { CUR = localStorage.getItem('module1_cur') || null; } catch (e) {}
+if (CLOUD && CUR && !CRED) CUR = null;
 let TEACHER = false;
 const me = () => (CUR && DB.students[CUR]) || null;
 const newStudent = o => Object.assign({ created: Date.now(), viewed: {}, acts: {}, texts: {}, pre: [], post: [], time: 0, log: [] }, o);
 function log(st, e) { st.log.push({ t: Date.now(), e }); if (st.log.length > 400) st.log.shift(); }
 function toast(m) { const d = document.createElement('div'); d.className = 'toast'; d.textContent = m; document.body.appendChild(d); setTimeout(() => d.remove(), 2400); }
 function saveCur() { try { localStorage.setItem('module1_cur', CUR || ''); } catch (e) {} }
+
+/* ---------- المزامنة مع جوجل شيت (وضع السحابة) ---------- */
+const SYNC = { dirty: false, timer: null, busy: false, state: CLOUD ? '☁️ جاهز' : '', lastPull: 0 };
+async function api(action, payload) {
+  const r = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(Object.assign({ action }, payload || {})), redirect: 'follow' });
+  return r.json();
+}
+function setSyncState(s) { SYNC.state = s; const el = $('#sync'); if (el) el.textContent = s; }
+const summaryOf = st => ({ progress: progress(st), status: status(st).t, minutes: Math.round(st.time / 60) });
+const slim = st => { const rec = Object.assign({}, st, { log: st.log.slice(-40) }); delete rec.pin; return rec; };
+function schedulePush() { if (!CLOUD || DB_TEACHER || !me() || !CRED) return; SYNC.dirty = true; clearTimeout(SYNC.timer); SYNC.timer = setTimeout(pushNow, 8000); setSyncState('☁️ بانتظار المزامنة…'); }
+function mergeServer(st, rec) {
+  let ch = false; if (!rec || !rec.post) return ch;
+  (st.post || []).forEach(a => { const o = rec.post.find(x => x.at === a.at); if (o && o.grades && JSON.stringify(o.grades) !== JSON.stringify(a.grades)) { a.grades = o.grades; a.comments = o.comments; ch = true; } });
+  return ch;
+}
+async function pushNow() {
+  const st = me(); if (!CLOUD || !st || !CRED || SYNC.busy) return; clearTimeout(SYNC.timer); SYNC.busy = true;
+  try {
+    const res = await api('push', { user: st.user, pin: CRED, record: slim(st), summary: summaryOf(st) });
+    if (res.ok) { SYNC.dirty = false; setSyncState('☁️ تمت المزامنة ✔'); if (mergeServer(st, res.record)) saveLocal(); } else setSyncState('⚠️ ' + (res.error || 'تعذرت المزامنة'));
+  } catch (e) { setSyncState('⚠️ غير متصل — ستُعاد المحاولة'); SYNC.timer = setTimeout(pushNow, 30000); }
+  SYNC.busy = false;
+}
+async function pullAll() {
+  const st = me(); if (!CLOUD || !st || !CRED) return;
+  try {
+    const [a, b] = await Promise.all([api('pull', { user: st.user, pin: CRED }), api('forum', { user: st.user, pin: CRED })]);
+    let ch = false;
+    if (a.ok && mergeServer(st, a.record)) ch = true;
+    if (b.ok && JSON.stringify(b.forum) !== JSON.stringify(DB.forum)) { DB.forum = b.forum; ch = true; }
+    if (ch) { saveLocal(); render(); }
+  } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => {
+  const st = me(); if (!document.hidden || !CLOUD || !st || !CRED || !SYNC.dirty) return;
+  try { navigator.sendBeacon(API, new Blob([JSON.stringify({ action: 'push', user: st.user, pin: CRED, record: slim(st), summary: summaryOf(st) })], { type: 'text/plain;charset=utf-8' })); } catch (e) {}
+});
+async function enterCloud(user, pin, rec) {
+  DB.students[user] = Object.assign(newStudent({}), rec, { user }); CUR = user; CRED = pin;
+  try { sessionStorage.setItem('module1_cred', pin); } catch (e) {}
+  saveCur(); saveLocal(); LASTSEC = null; SYNC.lastPull = 0; goto('card', 0); pullAll();
+}
+if (CLOUD) fetch(API).then(r => r.json()).then(j => { if (j && j.settings) { DB.settings.podcast = j.settings.podcast || ''; DB.settings.mastery = +j.settings.mastery || 80; saveLocal(); } }).catch(() => {});
 
 /* ---------- الأقسام ---------- */
 const SECS = [
@@ -110,6 +160,7 @@ function render() {
   if (!lk && VIEW_ITEMS.includes(cur.id) && idx === scr.length - 1 && !st.viewed[cur.id]) st.viewed[cur.id] = Date.now();
   if (LASTSEC !== cur.id) { log(st, 'زيارة: ' + cur.t); LASTSEC = cur.id; }
   save();
+  if (CLOUD && ['fb', 'log', 'post', 's4'].includes(cur.id) && Date.now() - SYNC.lastPull > 20000) { SYNC.lastPull = Date.now(); pullAll(); }
   root.innerHTML = shell(st, cur, scr, idx);
   $('#in').innerHTML = scr[idx].h;
   wireShell(); wireScreen(st);
@@ -145,7 +196,7 @@ function shell(st, cur, scr, idx) {
   return `<div class="app">
   <div class="topbar"><button class="tg" id="tg" title="إظهار/إخفاء القائمة">☰</button><b>الموديول الأول</b>
    <span class="where">${cur.ic} ${cur.t} · شاشة ${idx + 1} من ${scr.length}</span>
-   <span class="pg"><span class="pgbar"><i style="width:${p}%"></i></span>${p}%</span></div>
+   <span class="pg" id="sync" style="font-size:.8rem">${SYNC.state}</span><span class="pg"><span class="pgbar"><i style="width:${p}%"></i></span>${p}%</span></div>
   <div class="row"><aside class="side ${SIDE ? '' : 'off'}" id="side">
    <div class="me">👤 ${esc(st.name)}<br><small>المجموعة: ${esc(st.group)} · رقم الجلوس: ${esc(st.seat)}<br>اسم المستخدم: ${esc(st.user)}</small></div>
    <nav class="nav">${grpHTML.join('')}</nav>
@@ -159,7 +210,7 @@ function shell(st, cur, scr, idx) {
 function setSide(v) { SIDE = v; try { localStorage.setItem('module1_side', v ? '1' : '0'); } catch (e) {} const s = $('#side'); if (s) s.classList.toggle('off', !v); setTimeout(fit, 300); }
 function wireShell() {
   $('#tg').onclick = () => setSide(!SIDE);
-  $('#logout').onclick = () => { CUR = null; saveCur(); go('home'); };
+  $('#logout').onclick = () => { if (CLOUD && SYNC.dirty) pushNow(); CUR = null; CRED = null; try { sessionStorage.removeItem('module1_cred'); } catch (e) {} saveCur(); go('home'); };
   $$('.nav a').forEach(a => a.addEventListener('click', () => { if (window.innerWidth <= 860) setSide(false); }));
   $$('[data-grp]').forEach(g => g.onclick = () => { SHUT[g.dataset.grp] = !SHUT[g.dataset.grp]; g.classList.toggle('shut'); g.firstChild.textContent = (SHUT[g.dataset.grp] ? '▸' : '▾') + ' ' + g.dataset.grp; });
 }
@@ -203,7 +254,13 @@ function coverPage(mode) {
 function wireCover(mode) {
   const sp = $('#showpw'); if (sp) sp.onchange = () => $$('input[id^="l_pin"],input[id^="r_pin"]').forEach(x => x.type = sp.checked ? 'text' : 'password');
   if (mode === 'login') {
-    const go1 = () => {
+    const go1 = async () => {
+      if (CLOUD) {
+        const user = $('#l_user').value.trim().toLowerCase(), pin = $('#l_pin').value; $('#err').textContent = 'جارٍ التحقق…';
+        try { const res = await api('login', { user, pin }); if (!res.ok) { $('#err').textContent = res.error || 'اسم المستخدم أو كلمة المرور غير صحيحة'; return; } log(res.record, 'تسجيل دخول'); enterCloud(user, pin, res.record); }
+        catch (e) { $('#err').textContent = 'تعذر الاتصال بالخادم، تأكد من الإنترنت'; }
+        return;
+      }
       const s = DB.students[$('#l_user').value.trim().toLowerCase()];
       if (!s || s.pin !== $('#l_pin').value) { $('#err').textContent = 'اسم المستخدم أو كلمة المرور غير صحيحة'; return; }
       CUR = s.user; saveCur(); log(s, 'تسجيل دخول'); save(); LASTSEC = null; goto('card', 0);
@@ -211,17 +268,23 @@ function wireCover(mode) {
     $('#doLogin').onclick = go1; $('#l_pin').onkeydown = e => { if (e.key === 'Enter') go1(); };
   }
   if (mode === 'register') {
-    $('#doReg').onclick = () => {
+    $('#doReg').onclick = async () => {
       const v = id => $(id).value.trim(), e = m => $('#err').textContent = m;
       const name = v('#r_name'), group = v('#r_group'), seat = v('#r_seat'), user = v('#r_user').toLowerCase(), pin = $('#r_pin').value;
       if (name.split(/\s+/).length < 3) return e('اكتب الاسم ثلاثيًا على الأقل');
       if (!group) return e('اكتب المجموعة');
       if (!/^\d+$/.test(seat)) return e('رقم الجلوس يتكون من أرقام فقط');
-      if (Object.values(DB.students).some(x => x.seat === seat)) return e('رقم الجلوس هذا مسجل من قبل، سجّل الدخول بدلًا من ذلك');
+      if (!CLOUD && Object.values(DB.students).some(x => x.seat === seat)) return e('رقم الجلوس هذا مسجل من قبل، سجّل الدخول بدلًا من ذلك');
       if (!/^[a-z0-9._]{4,}$/.test(user)) return e('اسم المستخدم: 4 خانات على الأقل من الحروف الإنجليزية والأرقام (. _ مسموحة)');
-      if (DB.students[user]) return e('اسم المستخدم هذا مستخدم من قبل، اختر اسمًا آخر');
+      if (!CLOUD && DB.students[user]) return e('اسم المستخدم هذا مستخدم من قبل، اختر اسمًا آخر');
       if (pin.length < 6) return e('كلمة المرور 6 خانات على الأقل');
       if (pin !== $('#r_pin2').value) return e('تأكيد كلمة المرور غير مطابق');
+      if (CLOUD) {
+        const rs = newStudent({ name, group, seat, user, start: v('#r_date') || today() }); log(rs, 'إنشاء الحساب'); e('جارٍ إنشاء الحساب…');
+        try { const res = await api('register', { user, pin, record: rs }); if (!res.ok) return e(res.error || 'تعذر إنشاء الحساب'); enterCloud(user, pin, res.record || rs); }
+        catch (x) { e('تعذر الاتصال بالخادم، تأكد من الإنترنت'); }
+        return;
+      }
       const s = newStudent({ name, group, seat, user, pin, start: v('#r_date') || today() });
       log(s, 'إنشاء الحساب'); DB.students[user] = s; CUR = user; saveCur(); save(); LASTSEC = null; goto('card', 0);
     };
@@ -425,6 +488,7 @@ function wireScreen(st) {
 document.addEventListener('change', e => { const t = e.target; if (t.dataset && t.dataset.qk) { const [k, i] = t.dataset.qk.split(':'); QZ[k].ans[+i] = +t.value; } });
 document.addEventListener('input', e => { const t = e.target; if (t.dataset && t.dataset.ess && QZ.post) QZ.post.ess[t.dataset.ess] = t.value; if (t.id === 'newpost') { const w = $('#npw'); if (w) w.textContent = words(t.value) + ' كلمة'; } });
 const FI = { i: 0 };
+async function cloudPost(item) { if (!CLOUD || !CRED) return; try { const res = await api('post', { user: me().user, pin: CRED, item }); if (!res.ok) toast('تعذر نشر المشاركة على الخادم'); } catch (e) { toast('تعذر الاتصال: لم تُرسل المشاركة للخادم'); } }
 const DO = {
   qstart(b) { QZ[b.dataset.k] = { mode: 'take', ans: [], ess: {}, t0: Date.now() }; goto(b.dataset.k, 0); },
   qlast(b) { const st = me(), k = b.dataset.k, a = (k === 'pre' ? st.pre : st.post).slice(-1)[0]; QZ[k] = { mode: 'result', a }; goto(k, 0); },
@@ -442,7 +506,7 @@ const DO = {
   fprev() { FI.i--; render(); }, fnext() { FI.i++; render(); },
   sendpost() {
     const st = me(), t = $('#newpost').value.trim(); if (words(t) < 10) return toast('اكتب مداخلة لا تقل عن 10 كلمات');
-    DB.forum.push({ id: 'p' + Date.now(), sid: st.user, name: st.name, text: t, at: Date.now() }); log(st, 'مداخلة رئيسة في المنتدى'); save(); toast('تم النشر ✔'); FI.i = 0; goto('s4', 5);
+    DB.forum.push({ id: 'p' + Date.now(), sid: st.user, name: st.name, text: t, at: Date.now() }); log(st, 'مداخلة رئيسة في المنتدى'); save(); cloudPost(DB.forum[DB.forum.length - 1]); toast('تم النشر ✔'); FI.i = 0; goto('s4', 5);
   },
   reply(b) {
     const par = b.closest('.tools'); if (par.nextElementSibling && par.nextElementSibling.classList.contains('rbox')) return;
@@ -450,7 +514,7 @@ const DO = {
   },
   sendreply(b) {
     const st = me(), t = $('textarea', b.parentElement).value.trim(); if (words(t) < 5) return toast('اكتب تعقيبًا لا يقل عن 5 كلمات');
-    DB.forum.push({ id: 'r' + Date.now(), parent: b.dataset.p, sid: st.user, name: st.name, text: t, at: Date.now() }); log(st, 'تعقيب في المنتدى'); save(); toast('تم التعقيب ✔'); render();
+    DB.forum.push({ id: 'r' + Date.now(), parent: b.dataset.p, sid: st.user, name: st.name, text: t, at: Date.now() }); log(st, 'تعقيب في المنتدى'); save(); cloudPost(DB.forum[DB.forum.length - 1]); toast('تم التعقيب ✔'); render();
   },
   fbagain() { QZ.post = null; goto('post', 0); }
 };
@@ -603,6 +667,10 @@ function teacherTexts(st) {
 }
 
 /* ---------- لوحة الأستاذ (تتمرر عاديًا) ---------- */
+function teacherData(res, pin) {
+  TEACHER = true; TPIN = pin; DB_TEACHER = true; DB.students = {}; (res.students || []).forEach(r => { r.user = r.user; DB.students[r.user] = Object.assign(newStudent({}), r); });
+  DB.forum = res.forum || []; if (res.settings) { DB.settings.podcast = res.settings.podcast || ''; DB.settings.mastery = +res.settings.mastery || 80; }
+}
 function teacherPage(a) {
   if (!TEACHER) return `<div class="cover"><div class="arch"><div class="uni">لوحة الأستاذ</div><h2>👨‍🏫 تسجيل دخول الأستاذ</h2><div class="formcard"><label>الرقم السري للأستاذ</label><input type="password" id="t_pin"><div class="err" id="err"></div><div class="cta"><button class="btn green" id="tLogin">دخول</button><a class="btn ghost" href="#/home">رجوع</a></div><small>الرقم الافتراضي: 1234 — غيّره من الإعدادات بعد أول دخول.</small></div></div></div>`;
   const list = Object.values(DB.students).sort((x, y) => x.group.localeCompare(y.group, 'ar') || x.seat.localeCompare(y.seat, undefined, { numeric: true }));
@@ -612,16 +680,16 @@ function teacherPage(a) {
     return top + `<div class="tools"><a class="btn sm" href="#/teacher">← كل الطلاب</a></div>` + reportHTML(st) + teacherTexts(st) + gradeHTML(st) +
       `<div class="card warn"><h3>إجراءات</h3><div class="tools"><button class="btn sm gold" id="resetPin">إعادة كلمة المرور إلى اسم المستخدم</button><button class="btn sm maroon" id="delStu">حذف الطالب وسجله</button></div></div></div>`;
   }
-  if (a === 'settings') return top + `<div class="tools"><a class="btn sm" href="#/teacher">← كل الطلاب</a></div><h2>⚙️ الإعدادات</h2><div class="card"><label>الرقم السري للأستاذ</label><input type="text" id="s_pin" value="${esc(DB.settings.teacherPin)}">
+  if (a === 'settings') return top + `<div class="tools"><a class="btn sm" href="#/teacher">← كل الطلاب</a></div><h2>⚙️ الإعدادات</h2><div class="card"><label>الرقم السري للأستاذ</label><input type="text" id="s_pin" value="${CLOUD ? '' : esc(DB.settings.teacherPin)}" placeholder="${CLOUD ? 'اتركه فارغًا للإبقاء على الرقم الحالي' : ''}">
     <label>رابط حلقة البودكاست (يظهر للطلاب في مرحلة استقصِ)</label><input type="url" id="s_pod" value="${esc(DB.settings.podcast)}" placeholder="https://…">
     <label>مستوى الإتقان (%)</label><input type="number" id="s_m" min="50" max="100" value="${DB.settings.mastery}"><div class="tools"><button class="btn green" id="sSave">حفظ الإعدادات</button></div></div>
-    <div class="card warn"><h3>منطقة الخطر</h3><button class="btn maroon" id="wipe">مسح جميع بيانات البرنامج</button></div></div>`;
+    <div class="card warn"><h3>منطقة الخطر</h3>${CLOUD ? '<small>في وضع جوجل شيت تُدار البيانات من الجدول نفسه.</small>' : '<button class="btn maroon" id="wipe">مسح جميع بيانات البرنامج</button>'}</div></div>`;
   const rows = list.map(s => { const stt = status(s), bp = bestPre(s), bq = postBest(s), pend = s.post.some(x => !x.grades); return `<tr><td>${esc(s.name)}</td><td>${esc(s.user)}</td><td>${esc(s.group)}</td><td>${esc(s.seat)}</td><td>${progress(s)}%</td><td>${bp != null ? bp * 10 + '%' : '—'} <small>(${s.pre.length})</small></td><td>${bq != null ? bq * 10 + '%' : '—'} <small>(${s.post.length})</small>${pend ? ' <span class="pill y">تصحيح</span>' : ''}</td><td><span class="pill ${stt.c}">${stt.t}</span></td><td><a class="btn sm" href="#/teacher/${esc(s.user)}">فتح السجل</a></td></tr>`; }).join('');
   const n = list.length, avg = f => { const v = list.map(f).filter(x => x != null); return v.length ? Math.round(v.reduce((a, b) => a + b, 0) / v.length) : '—'; };
   const mast = list.filter(s => status(s).c === 'g').length;
   return top + `<h2>👨‍🏫 لوحة الأستاذ – سجل متابعة الطلاب</h2>
   <div class="grid"><div class="stat"><b>${n}</b>عدد الطلاب</div><div class="stat"><b>${avg(progress)}${n ? '%' : ''}</b>متوسط التقدم</div><div class="stat"><b>${avg(s => bestPre(s) != null ? bestPre(s) * 10 : null)}%</b>متوسط القبلي</div><div class="stat"><b>${avg(s => postBest(s) != null ? postBest(s) * 10 : null)}%</b>متوسط البعدي</div><div class="stat"><b>${mast}</b>أتقنوا الموديول</div></div>
-  <div class="tools"><button class="btn sm green" id="csv">⬇ تصدير Excel (CSV)</button><button class="btn sm" id="bak">💾 نسخة احتياطية (JSON)</button><label class="btn sm ghost" style="margin:0">⬆ استيراد نسخة<input type="file" id="imp" accept=".json" class="hidden"></label><a class="btn sm gold" href="#/teacher/settings">⚙️ الإعدادات</a></div>
+  <div class="tools"><button class="btn sm green" id="csv">⬇ تصدير Excel (CSV)</button><button class="btn sm" id="bak">💾 نسخة احتياطية (JSON)</button>${CLOUD ? '<button class="btn sm green" id="tRefresh">🔄 تحديث من جوجل شيت</button>' : '<label class="btn sm ghost" style="margin:0">⬆ استيراد نسخة<input type="file" id="imp" accept=".json" class="hidden"></label>'}<a class="btn sm gold" href="#/teacher/settings">⚙️ الإعدادات</a></div>
   <div class="tblwrap"><table><tr><th>الطالب</th><th>اسم المستخدم</th><th>المجموعة</th><th>رقم الجلوس</th><th>التقدم</th><th>القبلي (محاولات)</th><th>البعدي (محاولات)</th><th>الحالة</th><th></th></tr>${rows || '<tr><td colspan="9">لا يوجد طلاب مسجلون بعد على هذا الجهاز</td></tr>'}</table></div>
   <div class="card info"><small>ملاحظة: بيانات البرنامج تُحفظ في متصفح هذا الجهاز. لجمع بيانات طلاب من أجهزة مختلفة اطلب من كل طالب «نسخة احتياطية» ثم استوردها هنا (يُدمج الطلاب بحسب اسم المستخدم).</small></div></div>`;
 }
@@ -633,28 +701,31 @@ function gradeHTML(st) {
    <div class="tools"><button class="btn green gsave">حفظ الدرجات</button></div></div>`).join('');
 }
 function wireTeacher(a) {
-  if (!TEACHER) { const f = () => { if ($('#t_pin').value === DB.settings.teacherPin) { TEACHER = true; try { sessionStorage.setItem('module1_t', '1'); } catch (e) {} render(); } else $('#err').textContent = 'الرقم السري غير صحيح'; }; $('#tLogin').onclick = f; $('#t_pin').onkeydown = e => { if (e.key === 'Enter') f(); }; return; }
-  const out = $('#tOut'); if (out) out.onclick = () => { TEACHER = false; try { sessionStorage.removeItem('module1_t'); } catch (e) {} go('home'); };
+  if (!TEACHER) { const f = async () => { if (CLOUD) { const pin = $('#t_pin').value; $('#err').textContent = 'جارٍ التحميل…'; try { const res = await api('tlist', { pin }); if (!res.ok) { $('#err').textContent = res.error || 'الرقم السري غير صحيح'; return; } teacherData(res, pin); render(); } catch (e) { $('#err').textContent = 'تعذر الاتصال بالخادم'; } return; } if ($('#t_pin').value === DB.settings.teacherPin) { TEACHER = true; try { sessionStorage.setItem('module1_t', '1'); } catch (e) {} render(); } else $('#err').textContent = 'الرقم السري غير صحيح'; }; $('#tLogin').onclick = f; $('#t_pin').onkeydown = e => { if (e.key === 'Enter') f(); }; return; }
+  const out = $('#tOut'); if (out) out.onclick = () => { TEACHER = false; if (CLOUD) { DB_TEACHER = false; TPIN = null; loadDB(); } try { sessionStorage.removeItem('module1_t'); } catch (e) {} go('home'); };
+  const rf = $('#tRefresh'); if (rf) rf.onclick = async () => { rf.textContent = 'جارٍ التحديث…'; try { const res = await api('tlist', { pin: TPIN }); if (res.ok) { teacherData(res, TPIN); render(); } else toast(res.error || 'تعذر التحديث'); } catch (e) { toast('تعذر الاتصال بالخادم'); } };
   if (a && a !== 'settings' && DB.students[a]) {
     const st = DB.students[a];
     $$('.gsave').forEach(b => b.onclick = () => {
       const card = b.closest('[data-ai]'), at = st.post[+card.dataset.ai], g = {}, c = {}; let bad = false;
       ESSAYS.forEach(e => { const v = card.querySelector(`[data-g="${e.id}"]`).value; if (v === '' || +v < 0 || +v > e.max) bad = true; g[e.id] = +v; c[e.id] = card.querySelector(`[data-c="${e.id}"]`).value.trim(); });
       if (bad) return toast('أدخل درجة صحيحة لكل سؤال');
-      at.grades = g; at.comments = c; log(st, `تصحيح المقالي: ${postTotal(at)}/10`); save(); toast('تم حفظ الدرجات ✔'); render();
+      at.grades = g; at.comments = c; log(st, `تصحيح المقالي: ${postTotal(at)}/10`);
+      if (CLOUD) { api('grade', { pin: TPIN, user: a, at: at.at, grades: g, comments: c }).then(res => { toast(res.ok ? 'تم حفظ الدرجات في جوجل شيت ✔' : (res.error || 'تعذر الحفظ')); }).catch(() => toast('تعذر الاتصال بالخادم')); render(); return; }
+      save(); toast('تم حفظ الدرجات ✔'); render();
     });
-    $('#resetPin').onclick = () => { if (confirm('إعادة كلمة المرور لتصبح مطابقة لاسم المستخدم؟ (ينبغي أن يغيّرها الطالب بعد دخوله)')) { st.pin = st.user; save(); toast('تمت إعادة كلمة المرور'); } };
-    $('#delStu').onclick = () => { if (confirm('حذف الطالب وسجله نهائيًا؟')) { delete DB.students[a]; DB.forum = DB.forum.filter(p => p.sid !== a); save(); go('teacher'); } };
+    $('#resetPin').onclick = () => { if (confirm('إعادة كلمة المرور لتصبح مطابقة لاسم المستخدم؟ (ينبغي أن يغيّرها الطالب بعد دخوله)')) { if (CLOUD) { api('resetpin', { pin: TPIN, user: a }).then(r => toast(r.ok ? 'تمت إعادة كلمة المرور' : (r.error || 'تعذر'))); } else { st.pin = st.user; save(); toast('تمت إعادة كلمة المرور'); } } };
+    $('#delStu').onclick = () => { if (confirm('حذف الطالب وسجله نهائيًا؟')) { if (CLOUD) api('deluser', { pin: TPIN, user: a }).catch(() => {}); delete DB.students[a]; DB.forum = DB.forum.filter(p => p.sid !== a); save(); go('teacher'); } };
     return;
   }
   if (a === 'settings') {
-    $('#sSave').onclick = () => { DB.settings.teacherPin = $('#s_pin').value || '1234'; DB.settings.podcast = $('#s_pod').value.trim(); DB.settings.mastery = Math.min(100, Math.max(50, +$('#s_m').value || 80)); save(); toast('تم الحفظ ✔'); };
-    $('#wipe').onclick = () => { if (confirm('سيتم مسح كل الطلاب والنتائج! هل أنت متأكد؟') && prompt('اكتب «مسح» للتأكيد') === 'مسح') { localStorage.removeItem(KEY); loadDB(); CUR = null; saveCur(); go('teacher'); } };
+    $('#sSave').onclick = () => { const np = $('#s_pin').value.trim(); DB.settings.podcast = $('#s_pod').value.trim(); DB.settings.mastery = Math.min(100, Math.max(50, +$('#s_m').value || 80)); if (CLOUD) { api('tsettings', { pin: TPIN, settings: { podcast: DB.settings.podcast, mastery: DB.settings.mastery, teacherPin: np } }).then(r => { if (r.ok && np) TPIN = np; toast(r.ok ? 'تم الحفظ في جوجل شيت ✔' : (r.error || 'تعذر الحفظ')); }).catch(() => toast('تعذر الاتصال بالخادم')); return; } DB.settings.teacherPin = np || '1234'; save(); toast('تم الحفظ ✔'); };
+    if ($('#wipe')) $('#wipe').onclick = () => { if (confirm('سيتم مسح كل الطلاب والنتائج! هل أنت متأكد؟') && prompt('اكتب «مسح» للتأكيد') === 'مسح') { localStorage.removeItem(KEY); loadDB(); CUR = null; saveCur(); go('teacher'); } };
     return;
   }
   $('#csv').onclick = exportCSV;
   $('#bak').onclick = () => download('module1_backup_' + today() + '.json', JSON.stringify(DB), 'application/json');
-  $('#imp').onchange = e => {
+  if ($('#imp')) $('#imp').onchange = e => {
     const f = e.target.files[0]; if (!f) return; const r = new FileReader();
     r.onload = () => { try { const o = JSON.parse(r.result); let n = 0; Object.values(o.students || {}).forEach(s => { s.user = s.user || s.seat; const old = DB.students[s.user]; if (!old || (s.log || []).length >= old.log.length) { DB.students[s.user] = s; n++; } }); (o.forum || []).forEach(p => { if (!DB.forum.some(x => x.id === p.id)) DB.forum.push(p); }); save(); toast('تم استيراد ' + n + ' طالب'); render(); } catch (err) { toast('ملف غير صالح'); } };
     r.readAsText(f);
@@ -670,7 +741,9 @@ function exportCSV() {
 document.addEventListener('click', e => { if (e.target.id === 'printBtn') window.print(); });
 
 /* ---------- زمن التعلم ---------- */
-setInterval(() => { const st = me(); if (st && !document.hidden && route()[0] === 's') { st.time += 15; save(); } }, 15000);
-try { TEACHER = sessionStorage.getItem('module1_t') === '1'; } catch (e) {}
+setInterval(() => { const st = me(); if (st && !document.hidden && route()[0] === 's') { st.time += 15; saveLocal(); } }, 15000);
+if (!CLOUD) { try { TEACHER = sessionStorage.getItem('module1_t') === '1'; } catch (e) {} }
 if (!location.hash) location.hash = '#/home'; else render();
+
+
 
