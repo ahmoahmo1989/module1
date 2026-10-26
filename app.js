@@ -1,4 +1,4 @@
-﻿/* برنامج الموديول الأول – شاشات منفصلة بأزرار السابق/التالي (البيانات في localStorage) */
+/* برنامج الموديول الأول – شاشات منفصلة بأزرار السابق/التالي (البيانات في localStorage) */
 'use strict';
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -65,6 +65,21 @@ async function pullAll() {
     if (a.ok && mergeServer(st, a.record)) ch = true;
     if (b.ok && JSON.stringify(b.forum) !== JSON.stringify(DB.forum)) { DB.forum = b.forum; ch = true; }
     if (ch) { saveLocal(); render(); }
+  } catch (e) {}
+  ensureKeys(st);
+}
+/* يجلب مفتاح التصحيح من السيرفر فقط بعد إرسال محاولة واحدة على الأقل (يطابق نفس شرط فتح شاشة «مفتاح الاختبار») */
+async function ensureKeys(st) {
+  if (!CLOUD || !st || !CRED) return;
+  try {
+    if (st.pre.length && PRE[0] && PRE[0].a == null) {
+      const r = await api('checkpost_m1', { user: st.user, pin: CRED, kind: 'pre', ans: [] });
+      if (r && r.ok) { PRE.forEach((q, i) => q.a = r.correct[i]); render(); }
+    }
+    if (st.post.length && POST[0] && POST[0].a == null) {
+      const r = await api('checkpost_m1', { user: st.user, pin: CRED, kind: 'post', ans: [] });
+      if (r && r.ok) { POST.forEach((q, i) => q.a = r.correct[i]); render(); }
+    }
   } catch (e) {}
 }
 document.addEventListener('visibilitychange', () => {
@@ -491,16 +506,21 @@ const FI = { i: 0 };
 async function cloudPost(item) { if (!CLOUD || !CRED) return; try { const res = await api('post', { user: me().user, pin: CRED, item }); if (!res.ok) toast('تعذر نشر المشاركة على الخادم'); } catch (e) { toast('تعذر الاتصال: لم تُرسل المشاركة للخادم'); } }
 const DO = {
   qstart(b) { QZ[b.dataset.k] = { mode: 'take', ans: [], ess: {}, t0: Date.now() }; goto(b.dataset.k, 0); },
-  qlast(b) { const st = me(), k = b.dataset.k, a = (k === 'pre' ? st.pre : st.post).slice(-1)[0]; QZ[k] = { mode: 'result', a }; goto(k, 0); },
+  async qlast(b) { const st = me(), k = b.dataset.k; await ensureKeys(st); const a = (k === 'pre' ? st.pre : st.post).slice(-1)[0]; QZ[k] = { mode: 'result', a }; goto(k, 0); },
   qagain(b) { QZ[b.dataset.k] = null; goto(b.dataset.k, 0); },
-  qsubmit(b) {
+  async qsubmit(b) {
     const st = me(), k = b.dataset.k, S = QZ[k], L = k === 'pre' ? PRE : POST;
     const ans = L.map((q, i) => S.ans[i] == null ? -1 : S.ans[i]);
     if (!confirm('هل أنت متأكد من إرسال الاختبار؟ سيُرصد في سجلك.')) return;
+    if (!CLOUD) return toast('هذا الاختبار يحتاج اتصالاً بالإنترنت لتصحيحه، تأكد من اتصالك وحاول مرة أخرى');
+    let chk;
+    try { chk = await api('checkpost_m1', { user: st.user, pin: CRED, kind: k, ans }); } catch (e) { chk = null; }
+    if (!chk || !chk.ok) return toast('تعذر تصحيح الاختبار الآن، تأكد من اتصالك وحاول مرة أخرى');
+    L.forEach((q, i) => { q.a = chk.correct[i]; });
     const r = scoreList(L, ans), secs = Math.round((Date.now() - S.t0) / 1000);
     let a;
-    if (k === 'pre') { a = { at: Date.now(), score: r.score, ans, skills: r.skills, secs }; st.pre.push(a); log(st, `اختبار قبلي: ${a.score}/10`); }
-    else { const es = {}; ESSAYS.forEach(e => es[e.id] = (S.ess[e.id] || '').trim()); a = { at: Date.now(), mcq: r.score, ans, skills: r.skills, essays: es, grades: null, secs }; st.post.push(a); log(st, `اختبار بعدي: الاختياري ${a.mcq}/6 (المقالي بانتظار التصحيح)`); }
+    if (k === 'pre') { a = { at: Date.now(), score: chk.score, ans, skills: r.skills, secs }; st.pre.push(a); log(st, `اختبار قبلي: ${a.score}/10`); }
+    else { const es = {}; ESSAYS.forEach(e => es[e.id] = (S.ess[e.id] || '').trim()); a = { at: Date.now(), mcq: chk.score, ans, skills: r.skills, essays: es, grades: null, secs }; st.post.push(a); log(st, `اختبار بعدي: الاختياري ${a.mcq}/6 (المقالي بانتظار التصحيح)`); }
     save(); QZ[k] = { mode: 'result', a }; goto(k, 0);
   },
   fprev() { FI.i--; render(); }, fnext() { FI.i++; render(); },
@@ -744,6 +764,3 @@ document.addEventListener('click', e => { if (e.target.id === 'printBtn') window
 setInterval(() => { const st = me(); if (st && !document.hidden && route()[0] === 's') { st.time += 15; saveLocal(); } }, 15000);
 if (!CLOUD) { try { TEACHER = sessionStorage.getItem('module1_t') === '1'; } catch (e) {} }
 if (!location.hash) location.hash = '#/home'; else render();
-
-
-
